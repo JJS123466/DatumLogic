@@ -1,9 +1,10 @@
-#define BLYNK_TEMPLATE_ID "TMPL358Y-gi_B"
-#define BLYNK_TEMPLATE_NAME "DatumLogiq"
-#define BLYNK_AUTH_TOKEN "HEXmPAp-X_IuVEJfFGtJ1W6Q3-tRUrPo"
+#define BLYNK_TEMPLATE_ID "TMPL3wXhqzVf8"
+#define BLYNK_TEMPLATE_NAME "DatumLogic"
+#define BLYNK_AUTH_TOKEN "Wyi9hWk4D0ckpGSiNSbe3AdJZ5mtMDs5"
 #include <Arduino.h>
 #include <BlynkSimpleEsp32.h>
 #include <Wire.h>
+#include <EEPROM.h>
 #include <RTClib.h>
 #include <DHT.h>
 #include <Adafruit_SSD1306.h>
@@ -14,12 +15,11 @@
 #include <SD.h>
 #include <Adafruit_BMP085.h>  // Library for BMP180
 #include <BH1750.h>           // Library for BH1750
-#include <Arduino.h>
 #include <HardwareSerial.h>
 #include <WiFiManager.h>
 #include "time.h"
 #define RESET_TIME 3000
-
+#define RESET_TIME1 2000 // reset time for press and hold of both buttons
 #define BUTTON_PIN 35
 #define BUTTON_PIN2 34
 #define SCREEN_WIDTH 128
@@ -41,8 +41,11 @@
 #define LED2 33
 #define relay1 22
 #define relay2 23
-HardwareSerial sim800Serial(2);  // Use Serial2 for SIM800 communication
+#include <Bounce2.h>
 
+Bounce btn1 = Bounce();
+Bounce btn2 = Bounce();
+HardwareSerial sim800Serial(2);
 // Initialize sensors
 Adafruit_BMP085 bmp180;  // Initialize BMP180 sensor
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
@@ -64,18 +67,21 @@ int displayMode = 0;
 bool lastButtonState = LOW;
 unsigned long lastDebounceTime = 0;
 unsigned long debounceDelay = 50;
-const int dryValue = 1188;  
-const int wetValue = 614;
-
+int dryValue = 1188;
+int wetValue  = 614;
+const int defaultDryValue = 1188;
+const int defaultWetValue = 614;
+#define EEPROM_ADDR_DRY 0
+#define EEPROM_ADDR_WET 4
 String url = "/macros/s/" + GAS_ID + "/exec?";
 unsigned long previousMillis = 0;
 String postData;
 int interval = 60000;  // 10 seconds for testing
-char auth[] = "HEXmPAp-X_IuVEJfFGtJ1W6Q3-tRUrPo";
+char auth[] = "Wyi9hWk4D0ckpGSiNSbe3AdJZ5mtMDs5";
 // Variables for sensor data
 float temperature = -1;
 float humidity = -1;
-float moisturePercentage = -1;
+float moisturePercentage = 0;
 float pressure = -1;  // Default to -1
 float lux = -1;       // Light intensity in lux
 int pumpThresholdValue;
@@ -89,6 +95,7 @@ int logStatus;
 bool sdFileExist;
 bool isLogging = false;
 bool backUpRequired = true;
+float filteredMoistureADC = 0;
 String ssid;
 String password;
 int lastCSQ = -1;
@@ -139,13 +146,66 @@ String getLocalTime() {
 
   return String(timeString);  // Return as a String
 }
+void saveCalibrationValues() {
+  EEPROM.put(EEPROM_ADDR_DRY, dryValue);
+  EEPROM.put(EEPROM_ADDR_WET, wetValue);
+  EEPROM.commit();
+}
+
+void loadCalibrationValues() {
+  EEPROM.get(EEPROM_ADDR_DRY, dryValue);
+  EEPROM.get(EEPROM_ADDR_WET, wetValue);
+
+  // If EEPROM is empty / corrupted → restore default values
+  if (dryValue < 200 || dryValue > 4000) dryValue = 1188;
+  if (wetValue  < 200 || wetValue > 4000) wetValue = 614;
+}
+
+bool showingCalibration = false;
+unsigned long calibrationDisplayTime = 0;
+
+void showCalibrationMessage(const char* type, int value) {
+  showingCalibration = true;
+  calibrationDisplayTime = millis();
+
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+
+  display.setTextSize(1);
+  display.setCursor(25, 10);
+  display.println("CALIBRATION");
+
+  // Special case: RESTORED → no value
+  if (strcmp(type, "RESTORED") == 0) {
+    display.setCursor(15, 30);
+    display.println("DEFAULT");
+    display.setCursor(15, 50);
+    display.println("CALIBRATED");
+  } 
+  else {
+    display.setCursor(15, 30);
+    display.printf("%s CALIBRATED", type);
+
+    display.setCursor(15, 50);
+    display.printf("VALUE: %d", value);
+  }
+
+  display.display();
+}
+
+
 
 void setup() {
-  // Configure LED2 for PWM (GPIO 33, channel 0)
+  btn1.attach(BUTTON_PIN, INPUT);
+  btn1.interval(5);
+  btn2.attach(BUTTON_PIN2, INPUT);
+  btn2.interval(5);
   pinMode(LED1, OUTPUT);
   pinMode(LED2, OUTPUT);
   digitalWrite(LED1,HIGH);
   digitalWrite(LED2,HIGH);
+  EEPROM.begin(16);
+  loadCalibrationValues();
   Serial.print("Init");
   WiFi.begin();
   setupBlynk();
@@ -277,7 +337,7 @@ void setup() {
   delay(500);
 
   // Set up the moisture sensor and button pins
-  pinMode(MOISTURE_PIN, INPUT);
+  //pinMode(MOISTURE_PIN, INPUT);
   pinMode(BUTTON_PIN, INPUT);
   pinMode(BUTTON_PIN2, INPUT);
 
@@ -321,17 +381,40 @@ void readMoisture() {
   unsigned long currentMillis = millis();
   if (currentMillis - previousMillisMoisture >= readIntervalMoisture) {
     previousMillisMoisture = currentMillis;
-    int moistureValue = analogRead(MOISTURE_PIN);
-    moisturePercentage = map(moistureValue, dryValue, wetValue, 0, 100);
+
+    int rawADC = analogRead(MOISTURE_PIN);
+
+    // Initialize filter on first run
+    static bool firstRun = true;
+    if (firstRun) {
+      filteredMoistureADC = rawADC;
+      firstRun = false;
+    }
+
+    // EMA filter
+    const float alpha = 0.4;
+    filteredMoistureADC = (alpha * rawADC) + ((1 - alpha) * filteredMoistureADC);
+
+    // Convert filtered ADC to % moisture
+    moisturePercentage = map(filteredMoistureADC, dryValue, wetValue, 0, 100);
+
+    if (moisturePercentage < 0) {
+      moisturePercentage = 0;
+    }
+
+
     moisturePercentage = constrain(moisturePercentage, 0, 100);
   }
 }
+
+
+
 
 void readPressure(){
     unsigned long currentMillis = millis();
     if (currentMillis - previousMillisPressure >= readIntervalPressure) {
         previousMillisPressure = currentMillis;
-        pressure = bmp180.begin() ? bmp180.readPressure() / 100.0F : -1; 
+        pressure = bmp180.readPressure() / 100.0F;
     }
 }
 
@@ -343,6 +426,7 @@ void readLightIntensity(){
     }
 }
 void loop() {
+
   handleLEDs();
   handleDisplayAndButtonActions();
   Blynk.run();
@@ -426,16 +510,49 @@ bool sendDataViaWiFi() {
 }
 
 void handleDisplayAndButtonActions() {
+
+    // STOP all normal display updates if calibration screen is active
+  if (showingCalibration) {
+      if (millis() - calibrationDisplayTime < 1500) {
+          return; // do nothing, keep calibration visible
+      } else {
+          showingCalibration = false; // resume normal UI
+      }
+  }
+
   unsigned long currentMillis = millis();
 
-  int button1State = digitalRead(BUTTON_PIN);
-  int button2State = digitalRead(BUTTON_PIN2);
+  btn1.update();
+  btn2.update();
 
-  // === Dual-button RESET ===
+  int button1State = btn1.read();
+  int button2State = btn2.read();
+
+  // === Temporary display state machine ===
+  enum DisplayTempState { NORMAL, SHORT_PRESS_SCREEN, WIFI_RESET_SCREEN, MANUAL_LOG_SCREEN };
+  static DisplayTempState tempState = NORMAL;
+  static unsigned long tempStart = 0;
+
+  // ============================================================
+  // INTERRUPT TEMP SCREEN TIMEOUT
+  // ============================================================
+  if (tempState != NORMAL) {
+    if ((tempState == SHORT_PRESS_SCREEN  && currentMillis - tempStart >= 1500) ||
+        (tempState == WIFI_RESET_SCREEN   && currentMillis - tempStart >= 1000) ||
+        (tempState == MANUAL_LOG_SCREEN   && currentMillis - tempStart >= 1000)) {
+      tempState = NORMAL;
+    }
+  }
+
+  // ============================================================
+  // DUAL BUTTON RESET
+  // ============================================================
   static unsigned long dualButtonStart = 0;
+
   if (button1State == HIGH && button2State == HIGH) {
     if (dualButtonStart == 0) dualButtonStart = currentMillis;
-    if (currentMillis - dualButtonStart >= RESET_TIME) {
+
+    if (currentMillis - dualButtonStart >= RESET_TIME1) {
       display.clearDisplay();
       display.setTextSize(1);
       display.setCursor(28, 0);
@@ -444,76 +561,89 @@ void handleDisplayAndButtonActions() {
       display.setTextSize(2);
       display.print("SYSTEM    RESETTING");
       display.display();
-      delay(1000);
-      display.clearDisplay();
-      display.display();
       ESP.restart();
     }
   } else {
     dualButtonStart = 0;
   }
 
-  // === Button 1: Short & Long Press Handling ===
-  static int lastButton1State = LOW;
+  // ============================================================
+  // BUTTON 1 logic
+  // ============================================================
   static unsigned long button1PressedTime = 0;
   static bool button1LongPressHandled = false;
+
   const unsigned long shortPressThreshold = 50;
   const unsigned long longPressThreshold = RESET_TIME;
 
-  if (button1State != lastButton1State) {
-    if (button1State == HIGH) {
-      button1PressedTime = currentMillis;
-      button1LongPressHandled = false;
-    } else if (button1State == LOW) {
-      unsigned long pressDuration = currentMillis - button1PressedTime;
-      if (pressDuration >= shortPressThreshold && pressDuration < longPressThreshold && !button1LongPressHandled) {
-        // === SHORT PRESS: WiFi + GSM Status ===
-        updateGSMStatus(); // make sure this fn updates lastCSQ and gsmConnected
-        display.clearDisplay();
-        display.setTextSize(1);
+  if (btn1.rose()) {
+    button1PressedTime = currentMillis;
+    button1LongPressHandled = false;
+  }
 
-        display.setCursor(0, 0);
-        display.print("WiFi: ");
-        if (WiFi.status() == WL_CONNECTED) {
-          display.print("OK");
-          display.setCursor(0, 10);
-          int rssi = WiFi.RSSI();
-          int wifiBars = (rssi >= -50) ? 5 :
-                         (rssi >= -60) ? 4 :
-                         (rssi >= -70) ? 3 :
-                         (rssi >= -80) ? 2 :
-                         (rssi >= -90) ? 1 : 0;
-          display.print("Signal: ");
-          for (int i = 0; i < wifiBars; i++) display.print(".");
-        } else {
-          display.print("DISCONNECTED");
-        }
+  if (btn1.fell()) {
+    unsigned long pressDuration = currentMillis - button1PressedTime;
 
-        display.setCursor(0, 26);
-        display.print("GSM: ");
-        if (gsmConnected) {
-          display.print("OK");
-          int gsmBars = (lastCSQ >= 20) ? 5 :
-                        (lastCSQ >= 15) ? 4 :
-                        (lastCSQ >= 10) ? 3 :
-                        (lastCSQ >= 5)  ? 2 :
-                        (lastCSQ >= 1)  ? 1 : 0;
-          display.setCursor(0, 36);
-          display.print("Signal: ");
-          for (int i = 0; i < gsmBars; i++) display.print(".");
-        } else {
-          display.print("NO SIGNAL");
-        }
+    if (pressDuration >= shortPressThreshold &&
+        pressDuration < longPressThreshold &&
+        !button1LongPressHandled) {
 
-        display.display();
-        delay(1500);
+      // === SHORT PRESS DISPLAY ===
+      updateGSMStatus();
+
+      display.clearDisplay();
+      display.setTextSize(1);
+
+      display.setCursor(0, 0);
+      display.print("WiFi: ");
+
+      if (WiFi.status() == WL_CONNECTED) {
+        display.print("OK");
+        display.setCursor(0, 10);
+        int rssi = WiFi.RSSI();
+        int wifiBars = (rssi >= -50) ? 5 :
+                       (rssi >= -60) ? 4 :
+                       (rssi >= -70) ? 3 :
+                       (rssi >= -80) ? 2 :
+                       (rssi >= -90) ? 1 : 0;
+        display.print("Signal: ");
+        for (int i = 0; i < wifiBars; i++) display.print(".");
+      } else {
+        display.print("DISCONNECTED");
       }
+
+      display.setCursor(0, 26);
+      display.print("GSM: ");
+
+      if (gsmConnected) {
+        display.print("OK");
+        int gsmBars = (lastCSQ >= 20) ? 5 :
+                      (lastCSQ >= 15) ? 4 :
+                      (lastCSQ >= 10) ? 3 :
+                      (lastCSQ >= 5)  ? 2 :
+                      (lastCSQ >= 1)  ? 1 : 0;
+        display.setCursor(0, 36);
+        display.print("Signal: ");
+        for (int i = 0; i < gsmBars; i++) display.print(".");
+      } else {
+        display.print("NO SIGNAL");
+      }
+
+      display.display();
+
+      tempState = SHORT_PRESS_SCREEN;
+      tempStart = currentMillis;
+      return;
     }
   }
 
-  if (button1State == HIGH && (currentMillis - button1PressedTime >= longPressThreshold) && !button1LongPressHandled) {
-    // === LONG PRESS: WiFi Reset ===
+  // === long press WiFi reset
+  if (button1State == HIGH &&
+      (currentMillis - button1PressedTime >= longPressThreshold) &&
+      !button1LongPressHandled) {
+
     Serial.println("WiFi config reset triggered by button1 long press.");
+
     display.clearDisplay();
     display.setTextSize(1);
     display.setCursor(28, 0);
@@ -522,37 +652,47 @@ void handleDisplayAndButtonActions() {
     display.setTextSize(2);
     display.print("WIFI SETUP");
     display.display();
-    delay(1000);
+
+    tempState = WIFI_RESET_SCREEN;
+    tempStart = currentMillis;
+
     wifiManager.resetSettings();
     setupWifi();
     setupBlynk();
     button1LongPressHandled = true;
+    return;
   }
 
-  lastButton1State = button1State;
-
-  // === Button 2: Short & Long Press Handling ===
-  static int lastButton2State = LOW;
+  // ============================================================
+  // BUTTON 2 logic
+  // ============================================================
   static unsigned long button2PressedTime = 0;
   static bool button2LongPressHandled = false;
 
-  if (button2State != lastButton2State) {
-    if (button2State == HIGH) {
-      button2PressedTime = currentMillis;
-      button2LongPressHandled = false;
-    } else if (button2State == LOW) {
-      unsigned long pressDuration = currentMillis - button2PressedTime;
-      if (pressDuration >= shortPressThreshold && pressDuration < longPressThreshold && !button2LongPressHandled) {
-        displayMode++;
-        if (displayMode > 6) displayMode = 0;
-        Serial.print("Display Mode Changed: ");
-        Serial.println(displayMode);
-      }
+  if (btn2.rose()) {
+    button2PressedTime = currentMillis;
+    button2LongPressHandled = false;
+  }
+
+  if (btn2.fell()) {
+    unsigned long pressDuration = currentMillis - button2PressedTime;
+
+    if (pressDuration >= shortPressThreshold &&
+        pressDuration < longPressThreshold &&
+        !button2LongPressHandled) {
+
+      displayMode++;
+      if (displayMode > 6) displayMode = 0;
+
+      Serial.print("Display Mode Changed: ");
+      Serial.println(displayMode);
     }
   }
 
-  if (button2State == HIGH && (currentMillis - button2PressedTime >= longPressThreshold) && !button2LongPressHandled) {
-    // === LONG PRESS: Manual Log ===
+  if (button2State == HIGH &&
+      (currentMillis - button2PressedTime >= longPressThreshold) &&
+      !button2LongPressHandled) {
+
     display.clearDisplay();
     display.setTextSize(1);
     display.setCursor(28, 0);
@@ -570,99 +710,114 @@ void handleDisplayAndButtonActions() {
     }
 
     display.display();
-    delay(1000);
+
+    tempState = MANUAL_LOG_SCREEN;
+    tempStart = currentMillis;
+
     button2LongPressHandled = true;
+    return;
   }
 
-  lastButton2State = button2State;
+  if (tempState == NORMAL) {
+    display.clearDisplay();
+    display.setCursor(0, 0);
+    display.setTextSize(2);
 
-  // === Display update ===
-  display.clearDisplay();
-  display.setCursor(0, 0);
-  display.setTextSize(2);
+    switch (displayMode) {
+      case 0: {
+        DateTime now = rtc.now();
+        display.print("Time, Date");
+        display.setCursor(0, 24);
+        display.printf("%02d:%02d:%02d", now.hour(), now.minute(), now.second());
+        display.setCursor(0, 48);
+        display.printf("%02d/%02d/%04d", now.day(), now.month(), now.year());
+      } break;
 
-  switch (displayMode) {
-    case 0: {
-      DateTime now = rtc.now();
-      display.print("Time, Date");
-      display.setCursor(0, 24);
-      display.printf("%02d:%02d:%02d", now.hour(), now.minute(), now.second());
-      display.setCursor(0, 48);
-      display.printf("%02d/%02d/%04d", now.day(), now.month(), now.year());
-      break;
+      case 1:
+        display.print("C.S.M.S.");
+        display.setCursor(0, 24);
+        display.print("Moisture: ");
+        display.setCursor(4, 48);
+        display.print(moisturePercentage);
+        display.println(" %");
+        break;
+
+      case 2:
+        display.print("BMP180");
+        display.setCursor(0, 24);
+        display.print("Pressure: ");
+        display.setCursor(4, 48);
+        readPressure();
+        display.printf("%.1f hPa", pressure);
+        break;
+
+      case 3:
+        display.print("BH1750");
+        display.setCursor(0, 24);
+        display.print("Light: ");
+        display.setCursor(4, 48);
+        readLightIntensity();
+        display.print(lux);
+        display.println(" lux");
+        break;
+
+      case 4:
+        display.print("DHT22");
+        display.setCursor(0, 24);
+        display.print("Humidity: ");
+        display.setCursor(4, 48);
+        readHumidity();
+        display.print(humidity);
+        display.println(" %");
+        break;
+
+      case 5:
+        display.setTextSize(2);
+        display.print("DHT22");
+        display.setCursor(0, 24);
+        display.print("Temp: ");
+        display.setCursor(4, 48);
+        readTemperature();
+        display.print(temperature);
+        display.println(" C");
+        break;
+
+      case 6: {
+        display.setTextSize(1);
+        DateTime now = rtc.now();
+        display.setCursor(0, 0);
+        display.printf("Time: %02d:%02d:%02d", now.hour(), now.minute(), now.second());
+        display.setCursor(0, 10);
+        display.print("Moist: ");
+        display.print(moisturePercentage);
+        display.println("%");
+        display.setCursor(0, 20);
+        display.print("Press: ");
+        readPressure();
+        display.print(pressure);
+        display.println(" hPa");
+        display.setCursor(0, 30);
+        display.print("Light: ");
+        readLightIntensity();
+        display.print(lux);
+        display.println(" lux");
+        display.setCursor(0, 40);
+        display.print("Temp: ");
+        readTemperature();
+        display.print(temperature);
+        display.println(" C");
+        display.setCursor(0, 50);
+        display.print("Humi: ");
+        readHumidity();
+        display.print(humidity);
+        display.println(" %");
+      } break;
     }
-    case 1:
-      display.print("C.S.M.S.");
-      display.setCursor(0, 24);
-      display.print("Moisture: ");
-      display.setCursor(4, 48);
-      readMoisture();
-      display.print(moisturePercentage); display.println(" %");
-      break;
-    case 2:
-      display.print("BMP180");
-      display.setCursor(0, 24);
-      display.print("Pressure: ");
-      display.setCursor(4, 48);
-      readPressure();
-      display.print(pressure); display.println(" hPa");
-      break;
-    case 3:
-      display.print("BH1750");
-      display.setCursor(0, 24);
-      display.print("Light: ");
-      display.setCursor(4, 48);
-      readLightIntensity();
-      display.print(lux); display.println(" lux");
-      break;
-    case 4:
-      display.print("DHT22");
-      display.setCursor(0, 24);
-      display.print("Humidity: ");
-      display.setCursor(4, 48);
-      readHumidity();
-      display.print(humidity); display.println(" %");
-      break;
-    case 5:
-      display.setTextSize(2);
-      display.print("DHT22");
-      display.setCursor(0, 24);
-      display.print("Temp: ");
-      display.setCursor(4, 48);
-      readTemperature();
-      display.print(temperature); display.println(" C");
-      break;
-    case 6: {
-      display.setTextSize(1);
-      DateTime now = rtc.now();
-      display.setCursor(0, 0);
-      display.printf("Time: %02d:%02d:%02d", now.hour(), now.minute(), now.second());
-      display.setCursor(0, 10);
-      display.print("Moist: ");
-      readMoisture();
-      display.print(moisturePercentage); display.println("%");
-      display.setCursor(0, 20);
-      display.print("Press: ");
-      readPressure();
-      display.print(pressure); display.println(" hPa");
-      display.setCursor(0, 30);
-      display.print("Light: ");
-      readLightIntensity();
-      display.print(lux); display.println(" lux");
-      display.setCursor(0, 40);
-      display.print("Temp: ");
-      readTemperature();
-      display.print(temperature); display.println(" C");
-      display.setCursor(0, 50);
-      display.print("Humi: ");
-      readHumidity();
-      display.print(humidity); display.println(" %");
-      break;
-    }
+
+    display.display();
   }
-
-  display.display();
 }
+
 
 
 
@@ -854,13 +1009,13 @@ BLYNK_WRITE(V12) {
         Blynk.virtualWrite(V3, pressure);
     }
 }
+
 BLYNK_WRITE(V13) {
-    int buttonState = param.asInt(); 
-    if (buttonState == 1) {        
-        readMoisture();
+    if (param.asInt() == 1) {
         Blynk.virtualWrite(V4, moisturePercentage);
     }
 }
+
 
 BLYNK_WRITE(V6) {
     int relay2State = param.asInt(); 
@@ -959,11 +1114,36 @@ BLYNK_WRITE(V18) {
   }
 }
 
-BLYNK_CONNECTED() {
-  Blynk.syncVirtual(V9,V10,V11,V12,V13,V5,V6,V14,V7,V8,V16,V18,V15,V17); // Sync states 
+BLYNK_WRITE(V19) {
+  if (param.asInt() == 1) {
+    int adc = analogRead(MOISTURE_PIN);
+    dryValue = adc;
+    saveCalibrationValues();
+    showCalibrationMessage("DRY", adc);
+  }
 }
-int currentTempID = 0;
+BLYNK_WRITE(V20) {
+  if (param.asInt() == 1) {
+    int adc = analogRead(MOISTURE_PIN);
+    wetValue = adc;
+    saveCalibrationValues();
+    showCalibrationMessage("WET", adc);
+  }
+}
+BLYNK_WRITE(V21) {
+  if (param.asInt() == 1) {
+    dryValue = defaultDryValue;
+    wetValue  = defaultWetValue;
+    saveCalibrationValues();
+    showCalibrationMessage("RESTORED", 0);
+  }
+}
 
+
+BLYNK_CONNECTED() {
+  Blynk.syncVirtual(V9,V10,V11,V12,V13,V5,V6,V14,V7,V8,V16,V21,V15,V17,V18,V19,V20);
+int currentTempID = 0;
+}
 String makeJSONEntry(String timestamp, String temp, String hum, String soil, String press, String lux) {
   return "{\"timestamp\":\"" + timestamp + "\", " +
          "\"temperature\":" + temp + ", " +
@@ -978,7 +1158,7 @@ bool sendData() {
   bool dataSent = false;
 
   while (cycleCount < 3 && !dataSent) {
-    // reconnectWiFi();  // Uncomment if you have this function
+    // reconnectWiFi();  
 
     if (WiFi.status() == WL_CONNECTED) {
       Serial.println("Attempting to send data via WiFi...");
@@ -1017,7 +1197,6 @@ void logData() {
 
   if (isnan(temperature)) temperature = -1;
   if (isnan(humidity)) humidity = -1;
-
   String timestamp = getFormattedTimestamp();  // Generate once
 
   logToSD("/dataLog.csv", timestamp, temperature, humidity, moisturePercentage, pressure, lux);
@@ -1186,6 +1365,10 @@ void logToSD(const char* filename, String timestamp, float temp, float hum, floa
 
 void setupWifi(){
   // Automatically connect to WiFi or start the portal if not connected
+    digitalWrite(relay1,HIGH); // turn of relays
+    digitalWrite(relay2,HIGH);
+    digitalWrite(LED1,LOW);
+    digitalWrite(LED2,LOW);
     display.clearDisplay();
     display.setTextSize(1);
     display.setCursor(28, 0);
